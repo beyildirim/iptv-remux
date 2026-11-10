@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+buffer.mode
+iptv-remux.env
+.env
