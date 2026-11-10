@@ -74,7 +74,7 @@ def buf_push(st, data):
         st["buf"].append(data)
         st["buf_bytes"] += len(data)
         cap = MAX_BACKLOG_DEEP if cfg["deep"] else MAX_BACKLOG
-        while st["buf_bytes"] > cap:
+        while st["buf"] and st["buf_bytes"] > cap:
             st["buf_bytes"] -= len(st["buf"].popleft())
 
 
@@ -102,16 +102,18 @@ def drop_bytes(st, n):
 
 
 def deque_resync_off(st, hi):
-    """Scan the whole backlog for the first PCR >= hi-2s — i.e. where live
-    content resumes after a replay region. Returns byte offset to drop to
-    reach it, or None if live hasn't landed yet."""
-    off = 0
+    """Scan the backlog for the first PCR >= hi-2s — where live content
+    resumes after a replay region. Snapshots under the lock, scans outside
+    it (a full deque can be 140MB). Tiny accepted race: a cap-eviction
+    between scan and drop can trim a few extra head bytes."""
     with st["buf_lock"]:
-        for ch in st["buf"]:
-            for po, p in find_pcrs(ch):
-                if p >= hi - 2 * 90000:
-                    return off + po
-            off += len(ch)
+        snap = list(st["buf"])
+    off = 0
+    for ch in snap:
+        for po, p in find_pcrs(ch):
+            if p >= hi - 2 * 90000:
+                return off + po
+        off += len(ch)
     return None
 
 
@@ -291,10 +293,11 @@ def ensure(cid):
         if p:
             # Carry the undrained backlog + PCR epoch into the respawn, so a
             # crash/restart resumes mid-content instead of jumping the player
-            # back to the live edge. Shares the old lock: a dying downloader
-            # may still push one stray chunk.
-            st["buf"], st["buf_lock"] = p["buf"], p["buf_lock"]
+            # back to the live edge. Snapshot-copy under the old lock: the
+            # deque shares bytes objects but the new state owns its counter,
+            # so a dying worker's stray push/pop can't drift it.
             with p["buf_lock"]:
+                st["buf"] = deque(p["buf"])
                 st["buf_bytes"] = p["buf_bytes"]
             st["pcr_hi"] = p["pcr_hi"]
         pipes[cid] = st
@@ -371,18 +374,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.err(403)
         path = self.path.split("?")[0]
         if path == "/buffer" or path.startswith("/buffer/"):
-            return self.buffer_ctl(path)
+            return self.buffer_ctl(path, cors=False)
         if path in ("/full.m3u", "/iptv.m3u", "/playlist.m3u"):
             return self.serve_file(os.path.join(BASE, "full.m3u"),
                                    "audio/x-mpegurl")
         parts = [x for x in path.split("/") if x]
-        if len(parts) >= 2 and parts[0] == "ch" and parts[1].isdigit():
+        if (len(parts) >= 2 and parts[0] == "ch"
+                and parts[1].isascii() and parts[1].isdigit()):
             cid, fname = parts[1], parts[-1]
             if len(parts) == 3 and fname == "index.m3u8":
                 st = ensure(cid)
                 target = os.path.join(st["dir"], "live.m3u8")
                 deadline = time.monotonic() + 25
                 while time.monotonic() < deadline:
+                    if st["proc"].poll() is not None:
+                        return self.err(502)
                     try:
                         if os.path.getsize(target) > 0:
                             break
@@ -406,7 +412,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.serve_seg(p["dir"], fname)
         return self.err(404)
 
-    def buffer_ctl(self, path):
+    def buffer_ctl(self, path, cors=True):
         mode = path.rsplit("/", 1)[-1]
         if mode == "deep":
             cfg["deep"] = True
@@ -428,7 +434,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "deep" if cfg["deep"] else "normal",
                 (PREFILL_DEEP if cfg["deep"] else PREFILL_NORMAL) // 1048576,
                 (MAX_BACKLOG_DEEP if cfg["deep"] else MAX_BACKLOG) // 1048576,
-            )).encode(), "text/plain")
+            )).encode(), "text/plain", cors=cors)
 
     def serve_playlist(self, st):
         """Serve live.m3u8 with segment URIs scoped to this generation, so
@@ -471,12 +477,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.err(404)
         return self._send(data, ct)
 
-    def _send(self, data, ct):
+    def _send(self, data, ct, cors=True):
         self.send_response(200)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if cors:  # Hot IPTV is a web app — player fetches need CORS
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if not getattr(self, "_head", False):
             try:
